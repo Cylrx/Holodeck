@@ -29,7 +29,7 @@ from ai2holodeck.generation.object_selector import ObjectSelector
 from ai2holodeck.generation.rooms import FloorPlanGenerator
 from ai2holodeck.generation.skybox import getSkybox
 from ai2holodeck.generation.small_objects import SmallObjectGenerator
-from ai2holodeck.generation.utils import get_top_down_frame, room_video
+from ai2holodeck.generation.utils import get_top_down_frame, save_graph
 from ai2holodeck.generation.wall_objects import WallObjectGenerator
 from ai2holodeck.generation.walls import WallGenerator
 from ai2holodeck.generation.windows import WindowGenerator
@@ -369,6 +369,15 @@ class Holodeck:
             os.path.join(save_dir, f"{query_name}.json"),
             json_kwargs=dict(indent=4),
         )
+        
+        # Save scene graphs
+        if hasattr(self.floor_object_generator, 'scene_graphs'):
+            for room_name, graph in self.floor_object_generator.scene_graphs.items():
+                save_graph(graph, room_name, "floor", save_dir)
+        
+        if hasattr(self.wall_object_generator, 'scene_graphs'):
+            for room_name, graph in self.wall_object_generator.scene_graphs.items():
+                save_graph(graph, room_name, "wall", save_dir)
 
         # save top down image
         if generate_image:
@@ -499,6 +508,16 @@ class Holodeck:
             f"{save_dir}/{folder_name}/{query_name}.json",
             json_kwargs=dict(indent=4),
         )
+        
+        # Save scene graphs
+        graph_save_dir = f"{save_dir}/{folder_name}"
+        if hasattr(self.floor_object_generator, 'scene_graphs'):
+            for room_name, graph in self.floor_object_generator.scene_graphs.items():
+                save_graph(graph, room_name, "floor", graph_save_dir)
+        
+        if hasattr(self.wall_object_generator, 'scene_graphs'):
+            for room_name, graph in self.wall_object_generator.scene_graphs.items():
+                save_graph(graph, room_name, "wall", graph_save_dir)
 
         # save top down image
         if generate_image:

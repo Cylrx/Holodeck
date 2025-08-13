@@ -12,7 +12,7 @@ from shapely.ops import substring
 
 import ai2holodeck.generation.prompts as prompts
 from ai2holodeck.generation.objaverse_retriever import ObjathorRetriever
-from ai2holodeck.generation.utils import get_bbox_dims
+from ai2holodeck.generation.utils import get_bbox_dims, to_mermaid_script
 
 
 class WallObjectGenerator:
@@ -129,6 +129,11 @@ class WallObjectGenerator:
         constraints = self.parse_wall_object_constraints(
             constraint_plan, wall_object_names, floor_object_names
         )
+        graph = to_mermaid_script(constraints)
+        
+        if not hasattr(self, 'scene_graphs'):
+            self.scene_graphs = {}
+        self.scene_graphs[f"{room_type}_{room_id}"] = graph
 
         # get wall objects
         wall_object2dimension = {

@@ -5,7 +5,15 @@ from typing import Dict, Any
 
 import compress_json
 import numpy as np
+import pathlib
 from PIL import Image
+import mermaid as md
+from mermaid.graph import Graph
+import base64
+import io, requests
+from PIL import Image as im
+import matplotlib.pyplot as plt
+
 from ai2thor.controller import Controller
 from ai2thor.hooks.procedural_asset_hook import ProceduralAssetHookRunner
 from moviepy.editor import (
@@ -17,6 +25,96 @@ from moviepy.editor import (
 from tqdm import tqdm
 
 from ai2holodeck.constants import HOLODECK_BASE_DATA_DIR, THOR_COMMIT_ID
+
+def to_mermaid_script(constraints: dict):
+    """Convert constraints dictionary to Mermaid flowchart syntax.
+    
+    Handles both floor object constraints (list format) and wall object constraints (dict format).
+    Creates a directed graph where nodes are labeled with global constraints
+    and edges are labeled with relational constraints.
+    """
+    lines = ["flowchart TD"]
+    edges = []
+    node_labels = {}
+    
+    # Detect constraint format (floor vs wall objects)
+    is_wall_format = constraints and isinstance(next(iter(constraints.values())), dict) and \
+                    'target_floor_object_name' in next(iter(constraints.values()))
+    
+    if is_wall_format:
+        # Handle wall object constraints
+        for obj_name, obj_constraints in constraints.items():
+            target = obj_constraints.get('target_floor_object_name')
+            height = obj_constraints.get('height', 'N/A')
+            
+            # Clean object names for Mermaid compatibility
+            clean_obj = obj_name.replace('-', '_').replace(' ', '_')
+            node_labels[clean_obj] = f'"{obj_name}<br/>height: {height}cm"'
+            
+            if target:
+                clean_target = target.replace('-', '_').replace(' ', '_')
+                edges.append(f'    {clean_obj} -->|"above"| {clean_target}')
+    else:
+        # Handle floor object constraints
+        for obj_name, obj_constraints in constraints.items():
+            clean_obj = obj_name.replace('-', '_').replace(' ', '_')
+            
+            # Find global constraint for node label
+            global_constraint = "middle"  # default
+            for constraint in obj_constraints:
+                if constraint.get('type') == 'global':
+                    global_constraint = constraint.get('constraint', 'middle')
+                    break
+            
+            node_labels[clean_obj] = f'"{obj_name}<br/>[{global_constraint}]"'
+            
+            # Process relational constraints for edges
+            for constraint in obj_constraints:
+                if 'target' in constraint:
+                    target = constraint['target']
+                    clean_target = target.replace('-', '_').replace(' ', '_')
+                    constraint_type = constraint.get('constraint', 'related')
+                    edge_label = f'"{constraint_type}"'
+                    edges.append(f'    {clean_obj} -->|{edge_label}| {clean_target}')
+    
+    # Add node definitions
+    for node_id, label in node_labels.items():
+        lines.append(f"    {node_id}[{label}]")
+    
+    # Add edges
+    lines.extend(edges)
+    
+    # Style nodes
+    lines.extend([
+        "    classDef default fill:#e1f5fe,stroke:#01579b,stroke-width:2px",
+        "    classDef wall fill:#fff3e0,stroke:#e65100,stroke-width:2px"
+    ])
+    
+    # Apply wall styling if wall format
+    if is_wall_format:
+        wall_nodes = ",".join(node_labels.keys())
+        lines.append(f"    class {wall_nodes} wall")
+    
+    return "\n".join(lines)
+
+def save_graph(script: str, name: str, type: str, path: str): 
+    path = pathlib.Path(path)
+    mmd_path = path / f"{name}_{type}_graph.mmd"
+    png_path = path / f"{name}_{type}_graph.png"
+    graph = Graph(f"{name}_{type}_graph", script)
+    graph.save(mmd_path)
+
+    def mm(graph):
+        graphbytes = graph.encode("utf8")
+        base64_bytes = base64.urlsafe_b64encode(graphbytes)
+        base64_string = base64_bytes.decode("ascii")
+        img = im.open(io.BytesIO(requests.get('https://mermaid.ink/img/' + base64_string).content))
+        plt.imshow(img)
+        plt.axis('off') # allow to hide axis
+        plt.savefig(png_path, dpi=1200)
+
+    print(script)
+    mm(script)
 
 
 def all_edges_white(img):
