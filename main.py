@@ -65,6 +65,7 @@ def generate_single_scene(args):
             use_constraint=ast.literal_eval(args.use_constraint),
             use_milp=ast.literal_eval(args.use_milp),
             random_selection=ast.literal_eval(args.random_selection),
+            geometry=ast.literal_eval(args.geometry),
         )
     except:
         print(
@@ -167,6 +168,11 @@ if __name__ == "__main__":
         "--random_selection",
         help="Whether to more random object selection, set to False will be more precise, True will be more diverse",
         default="False",
+    )
+    parser.add_argument(
+        "--geometry",
+        help="Whether to enable geometry-level placement filtering during object selection.",
+        default="True",
     )
     parser.add_argument(
         "--used_assets",

@@ -84,7 +84,7 @@ class Holodeck:
         self.clip_tokenizer = open_clip.get_tokenizer("ViT-L-14")
 
         # initialize sentence transformer
-        self.sbert_model = SentenceTransformer("all-mpnet-base-v2", device="cpu")
+        self.sbert_model = SentenceTransformer("all-mpnet-base-v2", device="cpu") # sentence -> dense vector 
 
         # objaverse version and asset dir
         self.objaverse_asset_dir = objaverse_asset_dir
@@ -269,6 +269,7 @@ class Holodeck:
         use_constraint=True,
         random_selection=False,
         use_milp=False,
+        geometry=True,
     ) -> Tuple[Dict[str, Any], str]:
         # initialize scene
         query = query.replace("_", " ")
@@ -303,6 +304,15 @@ class Holodeck:
 
         # select objects
         self.object_selector.random_selection = random_selection
+        # geometry gating
+        if hasattr(self.object_selector, "enable_geometry"):
+            self.object_selector.enable_geometry = bool(geometry)
+        else:
+            # stay robust if ObjectSelector doesn't have the field yet
+            try:
+                self.object_selector.enable_geometry = bool(geometry)
+            except Exception:
+                pass
         scene = self.select_objects(
             scene,
             additional_requirements_object=self.additional_requirements_object,

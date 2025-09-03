@@ -30,7 +30,34 @@ EXPECTED_OBJECT_ATTRIBUTES = [
 
 
 class ObjectSelector:
+    """Turn a user's text intent into validated, placeable 3D objects per room.
+
+    Newcomer overview:
+    - Input is a structured scene dict (rooms, walls, doors, windows, wall_height)
+      plus a text query.
+    - The LLM produces a structured per-room object plan (object names, descriptions,
+      counts, target location: floor or wall, optional size).
+    - The retriever resolves those textual objects into concrete asset IDs from the
+      asset database.
+    - Each candidate asset is validated for room fit, capacity (floor area or wall
+      width), and feasible collision-free placement considering doors, windows, and
+      openings using grid-based solvers.
+    - The method returns both the (possibly auto-corrected) plan and the selected
+      assets per room ready for downstream placement.
+
+    Units: scene geometry is typically meters; internal placement checks operate in
+    centimeters where required. Conversions are handled inside this class.
+    """
     def __init__(self, object_retriever: ObjathorRetriever, llm: OpenAI):
+        """Initialize the selector.
+
+        Args:
+            object_retriever: Asset retriever with a `database` mapping from
+                asset id to metadata and retrieval functions.
+            llm: Language model used to draft object selection plans from text
+                queries and room context.
+
+        """
         # object retriever
         self.object_retriever = object_retriever
         self.database = object_retriever.database
@@ -61,8 +88,47 @@ class ObjectSelector:
         self.random_selection = False
         self.reuse_selection = False
         self.multiprocessing = False
+        # gate for geometry feasibility checks; default enabled
+        self.enable_geometry = True
 
     def select_objects(self, scene, additional_requirements="N/A"):
+        """Create an object selection plan and pick concrete assets per room.
+
+        What this does end-to-end:
+          1) From room polygons, compute available floor area and wall width per room.
+          2) If no plan exists, ask the LLM to output a structured plan; otherwise reuse it.
+          3) For each planned object, retrieve candidate assets and filter by:
+             - category/annotation relevance (e.g., onFloor/onWall, not doors/windows)
+             - dimensional fit to the room and capacity budget
+             - feasible, collision-free placement in the room (grid-based check)
+          4) If the floor is under-filled (< 80%), augment the plan via a second LLM pass
+             and retry selection.
+
+        Args:
+            scene: Scene dictionary with at least keys:
+                - 'query': str, user query driving selection
+                - 'rooms': List[dict] each with keys: 'id', 'roomType',
+                  'vertices' (List[Tuple[float, float]]), 'floorPolygon'
+                  (List[{'x': float, 'z': float}]).
+                - 'doors', 'windows': geometry with 'doorBoxes'/'windowBoxes'.
+                - 'open_walls': optional dict with 'openWallBoxes'.
+                - 'wall_height': float.
+                Optionally 'object_selection_plan' and 'selected_objects' to
+                reuse or recompute selections.
+            additional_requirements: Extra textual constraints for the LLM.
+
+        Returns:
+            Tuple[Dict[str, Dict[str, dict]], Dict[str, Dict[str, list]]]:
+                - object_selection_plan: Mapping roomType -> plan where each
+                  value is a dict of object_name -> attributes with keys:
+                  'description' (str), 'location' ('floor'|'wall'), 'size'
+                  (List[int] | None), 'quantity' (int), 'variance_type'
+                  ('same'|'varied'), 'objects_on_top' (List[dict]).
+                - selected_objects: Mapping roomType -> {'floor':
+                  List[Tuple[str, str]], 'wall': List[Tuple[str, str]]}, each
+                  entry a pair (object_instance_name, asset_id).
+
+        """
         rooms_types = [room["roomType"] for room in scene["rooms"]]
         room2area = {
             room["roomType"]: self.get_room_area(room) for room in scene["rooms"]
@@ -142,6 +208,35 @@ class ObjectSelector:
         return object_selection_plan, selected_objects
 
     def plan_room(self, args):
+        """Plan and select objects for a single room.
+
+        For a given room, build an LLM prompt from the scene's query, room type
+        and size, parse the JSON plan, select candidate assets, and check floor
+        fill. If under target fill, run a follow-up prompt to augment the plan
+        and retry selection.
+
+        Args:
+            args: Tuple containing
+                (room_type: str,
+                 scene: dict,
+                 additional_requirements: str,
+                 room2size: Dict[str, Tuple[float, float, float]],
+                 room2floor_capacity: Dict[str, List[float]],  # [total, used]
+                 room2wall_capacity: Dict[str, List[float]],  # [total, used]
+                 room2vertices: Dict[str, List[Tuple[float, float]]])
+                where vertices are in centimeters for placement checks.
+
+        Returns:
+            Tuple[str, Dict[str, object]]: (room_type, result) where result has
+                keys:
+                - 'floor': List[Tuple[str, str]] selected floor objects
+                - 'wall': List[Tuple[str, str]] selected wall objects
+                - 'plan': Dict[str, dict] finalized per-room plan
+
+        Notes:
+            Two-pass strategy: if floor fill < 80% of capacity, augment plan via
+            a second LLM prompt and recompute selections.
+        """
         (
             room_type,
             scene,
@@ -164,7 +259,7 @@ class ObjectSelector:
         )
 
         output_1 = self.llm(prompt_1).lower()
-        plan_1 = self.extract_json(output_1)
+        plan_1: Dict | None = self.extract_json(output_1)
 
         if plan_1 is None:
             print(f"Error while extracting the JSON for {room_type}.")
@@ -249,6 +344,20 @@ class ObjectSelector:
             return obj
 
     def extract_json(self, input_string):
+        """Extract and validate an object plan from a model string output.
+
+        Search for a single top-level JSON object in the LLM output, parse to a
+        dict, normalize attribute keys (lowercase, underscores), and validate
+        against the expected schema. Non-conforming fields are defaulted where
+        safe or cause a rejection.
+
+        Args:
+            input_string: Raw model output which may contain a JSON object.
+
+        Returns:
+            Optional[Dict[str, dict]]: Object plan mapping object_name ->
+            attributes if valid; otherwise None.
+        """
         # Using regex to identify the JSON structure in the string
         json_match = re.search(r"{.*}", input_string, re.DOTALL)
         if json_match:
@@ -290,6 +399,24 @@ class ObjectSelector:
             return None
 
     def check_dict(self, dict):
+        """Validate and sanitize an object plan dictionary in-place.
+
+        Requirements per object entry:
+          - Required keys present: description, location, size, quantity,
+            variance_type, objects_on_top
+          - Invalid location -> 'floor'
+          - Invalid size -> None (must be List[int] of length 3)
+          - Invalid quantity -> 1
+          - Invalid variance_type -> 'same'
+          - Invalid objects_on_top -> [] (children coerced similarly)
+
+        Args:
+            dict: Candidate plan mapping object_name -> attributes.
+
+        Returns:
+            Optional[Dict[str, dict]]: The sanitized plan if valid, otherwise
+            None.
+        """
         valid = True
 
         for key, value in dict.items():
@@ -361,10 +488,27 @@ class ObjectSelector:
     def get_objects_by_room(
         self, parsed_plan, scene, room_size, floor_capacity, wall_capacity, vertices
     ):
+        """Split plan by location, then select assets for floor and wall.
+
+        Args:
+            parsed_plan: Dict[str, dict] object plan from `extract_json(llm_outut)` in `plan_room`
+            scene: Full scene dictionary for geometry context.
+            room_size: Tuple[float, float, float] = (length, height, width).
+            floor_capacity: List[float] = [total_area, used_area] in m^2.
+            wall_capacity: List[float] = [total_width, used_width] in m.
+            vertices: List[Tuple[float, float]] room polygon vertices in cm for
+                placement checks.
+
+        Returns:
+            Tuple[List[Tuple[str, str]], List[float], List[Tuple[str, str]], List[float]]: 
+                (floor_objects, floor_capacity, wall_objects, wall_capacity),
+                where each object is a pair (object_instance_name, asset_id).
+        """
         # get the floor and wall objects
         floor_object_list = []
         wall_object_list = []
         for object_name, object_info in parsed_plan.items():
+            # merge object_name into object_info
             object_info["object_name"] = object_name
             if object_info["location"] == "floor":
                 floor_object_list.append(object_info)
@@ -381,6 +525,16 @@ class ObjectSelector:
         return floor_objects, floor_capacity, wall_objects, wall_capacity
 
     def get_room_size(self, room, wall_height):
+        """Compute room size as (length, height, width).
+
+        Args:
+            room: Dict with 'floorPolygon' as a list of points [{'x','z'}].
+            wall_height: Room height.
+
+        Returns:
+            Tuple[float, float, float]: (max(x_dim, z_dim), wall_height,
+            min(x_dim, z_dim)). Units follow the scene (usually meters).
+        """
         floor_polygon = room["floorPolygon"]
         x_values = [point["x"] for point in floor_polygon]
         z_values = [point["z"] for point in floor_polygon]
@@ -393,11 +547,27 @@ class ObjectSelector:
             return (z_dim, wall_height, x_dim)
 
     def get_room_area(self, room):
+        """Return area of a room polygon.
+
+        Args:
+            room: Dict with 'vertices' (List[Tuple[float, float]]).
+
+        Returns:
+            float: Polygon area in squared scene units.
+        """
         room_vertices = room["vertices"]
         room_polygon = Polygon(room_vertices)
         return room_polygon.area
 
     def get_room_perimeter(self, room):
+        """Return perimeter length of a room polygon.
+
+        Args:
+            room: Dict with 'vertices' (List[Tuple[float, float]]).
+
+        Returns:
+            float: Polygon perimeter in scene units.
+        """
         room_vertices = room["vertices"]
         room_polygon = Polygon(room_vertices)
         return room_polygon.length
@@ -405,6 +575,20 @@ class ObjectSelector:
     def get_floor_objects(
         self, floor_object_list, floor_capacity, room_size, room_vertices, scene
     ):
+        """Resolve floor-plan entries to assets with geometric feasibility.
+
+        Args:
+            floor_object_list: Per-plan entries with 'object_name', 'description',
+                'size' (List[int] | None), 'quantity', optional 'variance_type'.
+            floor_capacity: [total_area, used_area] in m^2.
+            room_size: (length, height, width) in scene units.
+            room_vertices: Room polygon in centimeters for placement.
+            scene: Scene geometry for constraints.
+
+        Returns:
+            Tuple[List[Tuple[str, str]], List[float]]: Ordered selections and
+            updated capacity [total, used].
+        """
         selected_floor_objects_all = []
         for floor_object in floor_object_list:
             object_type = floor_object["object_name"]
@@ -445,10 +629,11 @@ class ObjectSelector:
             # check if the object is too big
             candidates = self.check_object_size(candidates, room_size)
 
-            # check if object can be placed on the floor
-            candidates = self.check_floor_placement(
-                candidates[:20], room_vertices, scene
-            )
+            # check if object can be placed on the floor (optional)
+            if self.enable_geometry:
+                candidates = self.check_floor_placement(
+                    candidates[:20], room_vertices, scene
+                )
 
             # No candidates found
             if len(candidates) == 0:
@@ -550,6 +735,20 @@ class ObjectSelector:
     def get_wall_objects(
         self, wall_object_list, wall_capacity, room_size, room_vertices, scene
     ):
+        """Resolve wall-plan entries to assets with geometric feasibility.
+
+        Args:
+            wall_object_list: Per-plan entries with 'object_name', 'description',
+                'size' (List[int] | None), 'quantity', 'variance_type'.
+            wall_capacity: [total_width, used_width] in scene units.
+            room_size: (length, height, width) in scene units.
+            room_vertices: Room polygon in centimeters for placement.
+            scene: Scene geometry for constraints.
+
+        Returns:
+            Tuple[List[Tuple[str, str]], List[float]]: Ordered selections and
+            updated capacity [total, used].
+        """
         selected_wall_objects_all = []
         for wall_object in wall_object_list:
             object_type = wall_object["object_name"]
@@ -590,10 +789,11 @@ class ObjectSelector:
             # check thin objects
             candidates = self.check_thin_object(candidates)
 
-            # check if object can be placed on the wall
-            candidates = self.check_wall_placement(
-                candidates[:20], room_vertices, scene
-            )
+            # check if object can be placed on the wall (optional)
+            if self.enable_geometry:
+                candidates = self.check_wall_placement(
+                    candidates[:20], room_vertices, scene
+                )
 
             if len(candidates) == 0:
                 print(
@@ -690,6 +890,20 @@ class ObjectSelector:
         return selected_wall_objects_ordered, wall_capacity
 
     def check_object_size(self, candidates, room_size):
+        """Filter out candidates that would not fit the room.
+
+        Rules:
+          - Reorder dims so X >= Z, then require each dim <= room_dim *
+            self.object_size_tolerance.
+          - For floor objects the X*Z footprint must be <= 50% of room X*Z.
+
+        Args:
+            candidates: List[Tuple[str, float]] of (asset_id, score).
+            room_size: Tuple[float, float, float] (length, height, width).
+
+        Returns:
+            List[Tuple[str, float]]: Candidates passing size checks.
+        """
         valid_candidates = []
         for candidate in candidates:
             dimension = get_bbox_dims(self.database[candidate[0]])
@@ -711,6 +925,17 @@ class ObjectSelector:
         return valid_candidates
 
     def check_thin_object(self, candidates):
+        """Filter wall candidates that are too thick for hanging/mounting.
+
+        A candidate is dropped if its Z thickness is greater than
+        min(X, Y) * self.thin_threshold.
+
+        Args:
+            candidates: List[Tuple[str, float]] of (asset_id, score).
+
+        Returns:
+            List[Tuple[str, float]]: Candidates within thickness limits.
+        """
         valid_candidates = []
         for candidate in candidates:
             dimension = get_bbox_dims(self.database[candidate[0]])
@@ -721,6 +946,18 @@ class ObjectSelector:
         return valid_candidates
 
     def random_select(self, candidates):
+        """Pick one candidate either uniformly or via softmax sampling.
+
+        If `self.random_selection` is False (default), applies softmax to
+        retrieval scores and samples with `torch.multinomial` to preserve
+        diversity among high scorers.
+
+        Args:
+            candidates: List[Tuple[str, float]] of (asset_id, score).
+
+        Returns:
+            Tuple[str, float]: The selected (asset_id, score) pair.
+        """
         if self.random_selection:
             selected_candidate = random.choice(candidates)
         else:
@@ -734,6 +971,20 @@ class ObjectSelector:
         return selected_candidate
 
     def update_floor_capacity(self, room2floor_capacity, scene):
+        """Account for floor area blocked by doors and open walls.
+
+        This increments the "used" portion of each room's floor capacity with the
+        polygon areas of doors and open walls whose centroids lie within the room
+        polygon.
+
+        Args:
+            room2floor_capacity: Dict[Hashable, List[float]] mapping room id to
+                [total_area, used_area] (both in squared scene units).
+            scene: Full scene containing door/open wall geometry.
+
+        Returns:
+            Dict[Hashable, List[float]]: Updated capacity mapping.
+        """
         for room in scene["rooms"]:
             room_vertices = room["vertices"]
             room_poly = Polygon(room_vertices)
@@ -755,6 +1006,19 @@ class ObjectSelector:
         return room2floor_capacity
 
     def update_wall_capacity(self, room2wall_capacity, scene):
+        """Account for usable wall width blocked by windows and openings.
+
+        This increments the "used" portion of each room's wall capacity by the
+        width of window/open-wall spans whose centroids fall inside the room polygon.
+
+        Args:
+            room2wall_capacity: Dict[Hashable, List[float]] mapping room id to
+                [total_width, used_width] (scene units, typically meters).
+            scene: Full scene containing window/open wall geometry.
+
+        Returns:
+            Dict[Hashable, List[float]]: Updated capacity mapping.
+        """
         for room in scene["rooms"]:
             room_vertices = room["vertices"]
             room_poly = Polygon(room_vertices)
@@ -781,6 +1045,17 @@ class ObjectSelector:
         return room2wall_capacity
 
     def check_floor_placement(self, candidates, room_vertices, scene):
+        """Filter out floor candidates with no feasible collision-free placement.
+
+        Args:
+            candidates: List[Tuple[str, float]] of (asset_id, score).
+            room_vertices: List[Tuple[float, float]] room polygon in cm.
+            scene: Full scene to derive door/window/opening occupancy.
+
+        Returns:
+            List[Tuple[str, float]]: Candidates with at least one feasible
+            placement solution.
+        """
         room_x = max([vertex[0] for vertex in room_vertices]) - min(
             [vertex[0] for vertex in room_vertices]
         )
@@ -822,6 +1097,17 @@ class ObjectSelector:
         return valid_candidates
 
     def check_wall_placement(self, candidates, room_vertices, scene):
+        """Filter out wall candidates with no feasible collision-free placement.
+
+        Args:
+            candidates: List[Tuple[str, float]] of (asset_id, score).
+            room_vertices: List[Tuple[float, float]] room polygon in cm.
+            scene: Full scene to derive door/window/opening occupancy volumes.
+
+        Returns:
+            List[Tuple[str, float]]: Candidates with at least one feasible
+            placement solution.
+        """
         room_x = max([vertex[0] for vertex in room_vertices]) - min(
             [vertex[0] for vertex in room_vertices]
         )
@@ -861,6 +1147,17 @@ class ObjectSelector:
         return valid_candidates
 
     def get_initial_state_floor(self, room_vertices, scene, add_window=True):
+        """Build initial occupancy for floor placement constraints.
+
+        Args:
+            room_vertices: List[Tuple[float, float]] room polygon in cm.
+            scene: Scene dict providing doors/windows/open walls.
+            add_window: Include windows in the occupancy map if True.
+
+        Returns:
+            Dict[str, Tuple[tuple, int, list, int]]: Mapping of obstacle id to
+            a tuple describing its position, orientation, polygon and a flag.
+        """
         doors, windows, open_walls = (
             scene["doors"],
             scene["windows"],
@@ -918,6 +1215,17 @@ class ObjectSelector:
         return initial_state
 
     def get_initial_state_wall(self, room_vertices, scene):
+        """Build initial occupancy volumes for wall placement constraints.
+
+        Args:
+            room_vertices: List[Tuple[float, float]] room polygon in cm.
+            scene: Scene dict providing doors/windows/open walls.
+
+        Returns:
+            Dict[str, Tuple[tuple, tuple, int, list, int]]: Mapping of obstacle
+            id to ((x_min, y_min, z_min), (x_max, y_max, z_max), orientation,
+            polygon, flag).
+        """
         doors, windows, open_walls = (
             scene["doors"],
             scene["windows"],

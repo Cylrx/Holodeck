@@ -21,7 +21,30 @@ from ai2holodeck.constants import HOLODECK_BASE_DATA_DIR, DEBUGGING
 
 
 class FloorPlanGenerator:
+    """Generate structured floor plans from text and assign surface materials.
+
+    This utility parses a raw, line-based floor-plan description produced by a
+    language model, validates room geometry, derives per-room vertex lists,
+    and assigns materials using a CLIP-based matcher. It can optionally
+    visualize the result via Matplotlib.
+    """
     def __init__(self, clip_model, clip_process, clip_tokenizer, llm: OpenAI):
+        """Create a floor plan generator.
+
+        Args:
+            clip_model: A model with CLIP-like APIs providing encode_image and
+                encode_text (torch.no_grad friendly), used for similarity.
+            clip_process: Image preprocessing callable/transform for CLIP image
+                tower. Passed through to the material selector.
+            clip_tokenizer: Text tokenizer callable compatible with the CLIP
+                text tower (returns token tensors for encode_text).
+            llm: A callable LangChain `OpenAI` LLM used as `llm(prompt) -> str`
+                to produce raw floor-plan text when none is provided.
+
+        Notes:
+            - No external IO is performed here; assets/features are loaded by
+              `MaterialSelector` on demand.
+        """
         self.json_template = {
             "ceilings": [],
             "children": [],
@@ -42,6 +65,36 @@ class FloorPlanGenerator:
         self.used_assets = []
 
     def generate_rooms(self, scene, additional_requirements="N/A", visualize=False):
+        """Resolve a scene description into validated rooms with materials.
+
+        This function obtains a raw floor plan (via the LLM if absent in
+        `scene`), parses and validates rooms, assigns materials, and optionally
+        renders a visualization.
+
+        Args:
+            scene: Dict-like object with required key `"query"` (str). If
+                `"raw_floor_plan"` (str) is not present, it will be generated
+                via the LLM and injected back into `scene`.
+            additional_requirements: Optional extra constraints passed to the
+                floor-plan prompt (str).
+            visualize: If True, draw and save a PDF visualization next to the
+                working directory.
+
+        Returns:
+            List[Dict[str, Any]]: Parsed rooms. Each room includes at least
+                keys: `roomType`, `id`, `vertices` (List[Tuple[float, float]]
+                in (x, z) plane), `full_vertices` (List[Tuple[float, float]]),
+                `floorPolygon` (List[Dict[str, float]] with x,y=0,z),
+                `floor_design`, `wall_design`, `floorMaterial`, `wallMaterial`.
+
+        Raises:
+            ValueError: If the parsed plan fails geometric validity checks.
+
+        Side Effects:
+            - Prints the user/LLM exchange and validation messages.
+            - Mutates `scene` by inserting `scene["raw_floor_plan"]` if absent.
+            - May create a `*.pdf` file if `visualize=True`.
+        """
         # get floor plan if not provided
         floor_plan_prompt = self.floor_plan_template.format(
             input=scene["query"], additional_requirements=additional_requirements
@@ -59,6 +112,22 @@ class FloorPlanGenerator:
         return rooms
 
     def get_plan(self, query, raw_plan, visualize=False):
+        """Parse, validate, and materialize a raw floor plan string.
+
+        Args:
+            query: Original scene query (used as filename stem when visualizing).
+            raw_plan: Raw multi-line text. Each non-empty line that contains
+                the separator `|` must follow:
+                `room_type | floor_design | wall_design | [(x1, z1), ...]`.
+            visualize: If True, visualize the geometry.
+
+        Returns:
+            List[Dict[str, Any]]: Validated rooms with `floorMaterial` and
+            `wallMaterial` assigned.
+
+        Raises:
+            ValueError: If geometry is invalid (propagated from parsing).
+        """
         parsed_plan = self.parse_raw_plan(raw_plan)
 
         # select materials
@@ -83,6 +152,30 @@ class FloorPlanGenerator:
         return parsed_plan
 
     def parse_raw_plan(self, raw_plan):
+        """Convert a raw plan string into structured, validated rooms.
+
+        Each valid line is lower-cased, split on `|`, and interpreted as
+        `(room_type, floor_design, wall_design, vertices_literal)`. Vertices are
+        parsed via `ast.literal_eval`, coerced to float, sorted consistently,
+        and expanded to `full_vertices` by including any vertices lying on the
+        room edges due to inter-room boundaries.
+
+        Args:
+            raw_plan: Raw text produced by the LLM or provided by caller.
+
+        Returns:
+            List[Dict[str, Any]]: Rooms with keys `roomType`, `id`, `vertices`,
+            `full_vertices`, `floorPolygon`, `floor_design`, `wall_design`.
+
+        Raises:
+            ValueError: If geometric validity checks fail (angles, overlap,
+                containment, disconnected rooms, or vertex-inside-room).
+
+        Notes:
+            - `roomType`, `floor_design`, and `wall_design` are lower-cased.
+            - `vertices` are 2D (x, z) in meters; `y` is assumed 0 for floors.
+            - Validation is performed by `check_validity` using Shapely.
+        """
         parsed_plan = []
         room_types = []
         plans = [plan.lower() for plan in raw_plan.split("\n") if "|" in plan]
@@ -146,6 +239,17 @@ class FloorPlanGenerator:
             return parsed_plan
 
     def vertices2xyz(self, vertices):
+        """Sort 2D vertices and project to `y=0` 3D dicts.
+
+        Args:
+            vertices: List[Tuple[float, float]] in arbitrary order, representing
+                polygon corners in the (x, z) plane.
+
+        Returns:
+            Tuple[List[Tuple[float, float]], List[Dict[str, float]]]:
+            (sorted_vertices_clockwise_starting_at_min_x,
+             [{"x": x, "y": 0.0, "z": z}, ...]).
+        """
         sort_vertices = self.sort_vertices(vertices)
         xyz_vertices = [
             {"x": vertex[0], "y": 0, "z": vertex[1]} for vertex in sort_vertices
@@ -153,10 +257,29 @@ class FloorPlanGenerator:
         return sort_vertices, xyz_vertices
 
     def xyz2vertices(self, xyz_vertices):
+        """Project 3D floor vertices back to 2D (x, z).
+
+        Args:
+            xyz_vertices: List of dicts with keys `x`, `y`, `z`.
+
+        Returns:
+            List[Tuple[float, float]]: (x, z) pairs.
+        """
         vertices = [(vertex["x"], vertex["z"]) for vertex in xyz_vertices]
         return vertices
 
     def sort_vertices(self, vertices):
+        """Return vertices sorted clockwise and rotated to start at min-x vertex.
+
+        Sorting is done by angle around the centroid, then the sequence is
+        rotated so that the vertex with the smallest x-coordinate is first.
+
+        Args:
+            vertices: List[Tuple[float, float]].
+
+        Returns:
+            List[Tuple[float, float]]: Sorted vertices.
+        """
         # Calculate the centroid of the polygon
         cx = sum(x for x, y in vertices) / max(len(vertices), 1)
         cy = sum(y for x, y in vertices) / max(len(vertices), 1)
@@ -178,6 +301,21 @@ class FloorPlanGenerator:
         return vertices_clockwise
 
     def get_full_vertices(self, original_vertices, all_vertices):
+        """Compute all vertices lying on the edges of a room polygon.
+
+        For each candidate in `all_vertices`, check whether it lies on any edge
+        of the polygon defined by `original_vertices` and return the subset that
+        do.
+
+        Args:
+            original_vertices: List[Tuple[float, float]] defining the polygon.
+            all_vertices: List[Tuple[float, float]] of global candidate points
+                (e.g., union of all room vertices).
+
+        Returns:
+            List[Tuple[float, float]]: Points from `all_vertices` that lie on
+            the polygon boundary of `original_vertices`.
+        """
         # Create line segments from the original vertices
         lines = [
             LineString(
@@ -200,6 +338,22 @@ class FloorPlanGenerator:
         return full_vertices
 
     def select_materials(self, designs, topk):
+        """Select a material name for each design label using CLIP similarity.
+
+        Args:
+            designs: List[str] of textual design prompts (e.g., floor or wall).
+            topk: How many candidates to retrieve before applying selection
+                (int > 0).
+
+        Returns:
+            Dict[str, Dict[str, str]]: Mapping
+                `design -> {"name": selected_material_name}`.
+
+        Notes:
+            - Previously selected assets in `self.used_assets` are deprioritized
+              but this list is not updated here.
+            - Color suggestions are computed but not currently returned.
+        """
         candidate_materials = self.material_selector.match_material(designs, topk=topk)[
             0
         ]
@@ -228,10 +382,27 @@ class FloorPlanGenerator:
         return design2materials
 
     def color2rgb(self, color_name):
+        """Convert a CSS color name to normalized RGB components.
+
+        Args:
+            color_name: CSS color keyword (str), case-insensitive.
+
+        Returns:
+            Dict[str, float]: `{"r": r, "g": g, "b": b}` with values in [0, 1].
+        """
         rgb = mcolors.to_rgb(color_name)
         return {"r": rgb[0], "g": rgb[1], "b": rgb[2]}
 
     def parsed2raw(self, rooms):
+        """Serialize parsed rooms back to the raw plan text format.
+
+        Args:
+            rooms: List[Dict[str, Any]] as produced by parsing.
+
+        Returns:
+            str: Multi-line text with lines of the form
+                `roomType | floor_design | wall_design | [(x1, z1), ...]`.
+        """
         raw_plan = ""
         for room in rooms:
             raw_plan += " | ".join(
@@ -246,6 +417,14 @@ class FloorPlanGenerator:
         return raw_plan
 
     def check_interior_angles(self, vertices):
+        """Test that all interior angles are within [90°, 270°].
+
+        Args:
+            vertices: List[Tuple[float, float]] ordered around the polygon.
+
+        Returns:
+            bool: True if every angle is >= 90 and <= 270 degrees.
+        """
         n = len(vertices)
         for i in range(n):
             a, b, c = vertices[i], vertices[(i + 1) % n], vertices[(i + 2) % n]
@@ -260,6 +439,21 @@ class FloorPlanGenerator:
         return True
 
     def check_validity(self, rooms):
+        """Validate geometric soundness across rooms.
+
+        Checks include:
+            - Per-room interior angles are within [90°, 270°].
+            - No two polygons are identical or one contains another.
+            - Each room shares at least one full edge (LineString intersection)
+              with some other room (i.e., connectivity via edges, not points).
+            - No vertex of one room lies strictly inside another room.
+
+        Args:
+            rooms: List[Dict[str, Any]] where each has `vertices`.
+
+        Returns:
+            Tuple[bool, str]: `(is_valid, message)`.
+        """
         room_polygons = [Polygon(room["vertices"]) for room in rooms]
 
         # check interior angles
@@ -302,6 +496,17 @@ class FloorPlanGenerator:
         return True, "The floor plan is valid."
 
     def visualize_floor_plan(self, query, parsed_plan):
+        """Render a simple polygon plot and save to `<query>.pdf`.
+
+        Args:
+            query: Scene query string; spaces are replaced with underscores for
+                the output filename.
+            parsed_plan: Output of `get_plan`/`parse_raw_plan` with `vertices`.
+
+        Side Effects:
+            - Modifies global Matplotlib rcParams (font family and size).
+            - Saves a PDF to the working directory and displays a window.
+        """
         plt.rcParams["font.family"] = "Times New Roman"
         plt.rcParams["font.size"] = 22
         fig, ax = plt.subplots(figsize=(10, 10))
