@@ -2,6 +2,7 @@ import copy
 import os
 from argparse import ArgumentParser
 from typing import Dict, Any
+from colorama import Fore
 
 import compress_json
 import numpy as np
@@ -13,6 +14,7 @@ import base64
 import io, requests
 from PIL import Image as im
 import matplotlib.pyplot as plt
+import zlib
 
 from ai2thor.controller import Controller
 from ai2thor.hooks.procedural_asset_hook import ProceduralAssetHookRunner
@@ -106,15 +108,26 @@ def save_graph(script: str, name: str, type: str, path: str):
 
     def mm(graph):
         graphbytes = graph.encode("utf8")
-        base64_bytes = base64.urlsafe_b64encode(graphbytes)
-        base64_string = base64_bytes.decode("ascii")
-        img = im.open(io.BytesIO(requests.get('https://mermaid.ink/img/' + base64_string).content))
+        compressed = zlib.compress(graphbytes)
+        base64_string = base64.urlsafe_b64encode(compressed).decode("ascii")
+        pako_string = "pako:" + base64_string
+        url = 'https://mermaid.ink/img/' + pako_string + '?type=png'
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        if not content_type.startswith("image/"):
+            # Provide helpful diagnostics if Mermaid Ink returns an error page
+            raise ValueError(f"Mermaid Ink returned non-image content: {content_type}. Body head: {resp.text[:200]}")
+        img = im.open(io.BytesIO(resp.content))
         plt.imshow(img)
         plt.axis('off') # allow to hide axis
         plt.savefig(png_path, dpi=1200)
 
     print(script)
-    mm(script)
+    try:
+        mm(script)
+    except Exception as e:
+        print(f"{Fore.RED}Warning: failed to generate mermaid image for {name}_{type}_graph: {e}{Fore.RESET}")
 
 
 def all_edges_white(img):
